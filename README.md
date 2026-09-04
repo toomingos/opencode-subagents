@@ -11,7 +11,8 @@ which is the same shape as a native sub-agent: fire, keep working, read one resu
 
 Works with opencode **v1** (`opencode`) and **v2** (`opencode2`). v2 is preferred when
 installed: every run is a thin client of one shared background server instead of a full
-runtime per agent, so ten parallel agents cost one server plus ten small clients.
+runtime per agent, so ten parallel agents cost one server plus ten small clients. `run.sh`
+starts that server detached before the first run (see [v2 background service](#v2-background-service)).
 
 ## Install
 
@@ -59,9 +60,11 @@ launch; the script imposes no limit. Size the batch to the machine: every agent 
 ### Monitoring one agent
 
 ```bash
-run.sh --peek list            # every run: state, minutes elapsed, run id
-run.sh --peek <run-id|word>   # state, elapsed, session, last text of one run
+run.sh --peek list            # every run: state, minutes elapsed, run id, rate-limit wait
+run.sh --peek <run-id|word>   # state, elapsed, session, rate-limit wait, last text of one run
 run.sh --events <run-id|word> # its tool calls and text so far, one line each
+run.sh --limits               # v2: every active session on the service, working or waiting on a rate limit
+run.sh --interrupt <run-id|word|ses_…|limited|all>   # v2: stop a session on the service
 ```
 
 `<word>` is any word from the title; the newest matching run wins. The raw JSON stream is
@@ -74,14 +77,72 @@ run.sh --events <run-id|word> # its tool calls and text so far, one line each
 | `--session <id>` | resume a previous run, id from the envelope |
 | `--peek [id\|word\|list]` | state, elapsed, session and last text of a run |
 | `--events [id\|word]` | condensed event log of a run |
+| `--limits` | v2 only: active sessions on the service; for rate-limited ones the attempt and next-try time |
+| `--interrupt <run\|word\|ses_…\|limited\|all>` | v2 only: interrupt one session, every rate-limited one, or every active one |
 
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `OPENCODE_BIN` | `opencode2` if on PATH, else `opencode` | which binary to run |
 | `OPENCODE_AGENT` | `build` | default agent |
-| `OPENCODE_STALL` | `900` | kill after N seconds with no new output |
-| `OPENCODE_MAXRUN` | `2700` | kill after N seconds total |
+| `OPENCODE_STALL` | `900` | kill after N seconds with no new output (v2: rate-limit waits do not count) |
+| `OPENCODE_MAXRUN` | `2700` | kill after N seconds total, rate-limit waits included |
 | `OPENCODE_RUNS` | `$TMPDIR/opencode-subagents-runs` | where raw streams are kept, 7-day retention |
+
+## v2 background service
+
+`opencode2 run` connects to one shared background server. If none is running, the first
+client spawns `opencode2 serve --service` as its **own child**, and that client owns it:
+stopping that client's process tree (Claude Code's task stop, `kill` of the process
+group, closing the terminal) kills the server too, and every other agent on it dies with
+`{"type":"error","error":{"message":"Transport"}}`. Their sessions survive on disk, but the
+runs are gone.
+
+`run.sh` avoids this by running `opencode2 service start` before the first run, which
+detaches the server (parent pid 1) so no client owns it. Parallel launches serialise on a
+lock so it starts once. Useful commands:
+
+```bash
+opencode2 service status     # URL of the running server, or "stopped"
+opencode2 service restart    # after upgrading opencode2, or when a session is wedged
+opencode2 api get /api/health
+```
+
+If you still see `lost the opencode2 background service mid-run` in a `task_error`, someone
+stopped the service; resume the run with `--session <id>` once it is back.
+
+The reverse also matters: a session keeps running on the service after its client is gone.
+`run.sh` interrupts the session when its watchdog fires and when it receives `TERM`/`INT`
+(Claude Code's task stop), so stopping a run stops the agent. A client killed with `KILL`
+cannot do that; its session carries on with nobody listening, so after a hard stop run
+`run.sh --limits` and `run.sh --interrupt <run|limited|all>` to clean up. On restart the
+service resumes every session that was active, including those.
+
+## Provider rate limits (v2)
+
+An HTTP 429 from the model provider does not end the run. opencode2 keeps the session
+alive and retries on a fixed schedule (15 minutes between attempts with the Console Go
+models), and the json stream prints **nothing** while it waits. Only the session's
+assistant message carries the state:
+
+```bash
+opencode2 api get /api/session/<id>/message | jq '[.data[] | select(.type=="assistant")] | first | .retry'
+# {"attempt":2,"at":1788535101301,"error":{"type":"provider.rate-limit","status":429,...}}
+```
+
+`at` is the epoch-millisecond time of the next attempt. `run.sh` polls this every 30 s
+while a run is quiet, so a run waiting on the provider is **not** killed as stalled; the
+wait still counts towards `OPENCODE_MAXRUN`, and if that expires the `task_error` says it was
+rate-limited and when the next attempt was due. `--peek` and `--peek list` show the same
+wait, and `--limits` lists every active session on the service (`/api/session/active`) with
+its wait, which is the quickest way to tell whether the limit has lifted before launching
+a new batch: when nothing is waiting, launch; when sessions show a next-try time, wait for it.
+
+There is no endpoint that says "the limit is over" ahead of time, and the provider sends no
+usable `Retry-After`. The only signals are a session's `retry` field disappearing (its next
+attempt succeeded) or a fresh run producing `text`/`tool_use` events. Launching more agents
+into a limit only queues more 15 minute retries, and orphaned sessions (clients killed
+outright, or a batch that was stopped) keep retrying in lock-step and can hold the limit
+open on their own; `--interrupt limited` clears them.
 
 ## Agents and permissions
 
@@ -93,9 +154,16 @@ with `--agent executor`.
 ### v2 (`opencode2`)
 
 Agents live in `.opencode/agents/<name>.md` (project) or `~/.config/opencode/agents/`
-(global). Permissions are an ordered rule list; the last matching rule wins. Actions are
-`shell`, `edit`, `read`, `glob`, `grep`, `webfetch`, `websearch`, `subagent`, `skill`.
+(global). Permissions are an ordered rule list; the last matching rule wins, and anything
+without a rule resolves to "ask". Actions are `shell`, `edit`, `read`, `glob`, `grep`,
+`webfetch`, `websearch`, `subagent`, `skill`, `question`, `external_directory`.
 An unknown `--agent` name is an error.
+
+`external_directory` is the one that bites headless: any path outside the project (a
+`cd ..`, a `cat ../../file`, an absolute path elsewhere) asks, and headless auto-rejects,
+so the agent's shell command fails with no explanation in its final text. Deny it
+explicitly and tell the agent to stay in the repository; allow only the directories you
+mean it to touch (opencode's own tool-output directory is a common one).
 
 ```markdown
 ---
@@ -111,9 +179,17 @@ permissions:
   - action: webfetch
     resource: "*"
     effect: deny
+  - action: external_directory
+    resource: "*"
+    effect: deny
+  - action: external_directory
+    resource: "~/.local/share/opencode/tool-output/*"
+    effect: allow
 ---
 
 You execute delegated tasks. Follow the prompt exactly and never expand scope.
+Stay inside the repository: no `cd ..`, no `../` paths above the repo root, no absolute
+paths outside it; access outside is denied headless.
 Final message: what changed, where, how verified, or what blocked you.
 ```
 
@@ -130,9 +206,14 @@ permission:
   edit: allow
   bash: allow
   webfetch: deny
+  external_directory:
+    "*": deny
+    "~/.local/share/opencode/tool-output/*": allow
 ---
 
 You execute delegated tasks. Follow the prompt exactly and never expand scope.
+Stay inside the repository: no `cd ..`, no `../` paths above the repo root, no absolute
+paths outside it; access outside is denied headless.
 Final message: what changed, where, how verified, or what blocked you.
 ```
 
