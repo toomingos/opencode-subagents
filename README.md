@@ -137,12 +137,28 @@ wait, and `--limits` lists every active session on the service (`/api/session/ac
 its wait, which is the quickest way to tell whether the limit has lifted before launching
 a new batch: when nothing is waiting, launch; when sessions show a next-try time, wait for it.
 
-There is no endpoint that says "the limit is over" ahead of time, and the provider sends no
-usable `Retry-After`. The only signals are a session's `retry` field disappearing (its next
-attempt succeeded) or a fresh run producing `text`/`tool_use` events. Launching more agents
-into a limit only queues more 15 minute retries, and orphaned sessions (clients killed
-outright, or a batch that was stopped) keep retrying in lock-step and can hold the limit
-open on their own; `--interrupt limited` clears them.
+`at` is a lower bound, not the provider's reset time. opencode reads the provider's
+`retry-after` header but clamps the delay to 15 minutes, so a longer reset just means
+another 429 and another 15 minute wait; it gives up after about five attempts. The header
+values are not exposed anywhere a client can read them, and neither the local API nor the
+Go gateway has a quota or usage endpoint (the Go plan limits are rolling windows with no
+published reset time). So the only signals are a session's `retry` field disappearing (its
+next attempt succeeded) or a fresh run producing `text`/`tool_use` events.
+
+For a push signal instead of polling, subscribe to the server's event stream. Basic auth
+with the password from `~/.local/state/opencode/service.json`, scoped to the project:
+
+```bash
+curl -sN -u "opencode:$PW" -H "x-opencode-directory: $PWD" "$URL/api/event"
+# session.retry.scheduled     {sessionID, assistantMessageID, attempt, at, error}  -> wait began
+# session.execution.succeeded | failed | interrupted                               -> retry cleared
+```
+
+Launching more agents into a limit only queues more 15 minute retries, and orphaned
+sessions (clients killed outright, or a batch that was stopped) keep retrying in lock-step
+and can hold the limit open on their own; `--interrupt limited` clears them. Note that
+`/api/session/active` and `POST /api/session/<id>/wait` treat a session asleep in backoff as
+running, so neither is a rate-limit indicator on its own.
 
 ## Agents and permissions
 
