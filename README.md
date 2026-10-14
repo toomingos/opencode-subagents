@@ -235,6 +235,12 @@ Final message: what changed, where, how verified, or what blocked you.
 
 Keep both directories if you switch between versions; each reads only its own.
 
+## Packaging for skill marketplaces
+
+`scripts/package.sh` builds `dist/opencode-subagents.zip`, the skill folder with `SKILL.md`,
+`run.sh`, `README.md` and `LICENSE`, which is the upload format marketplaces such as
+[Agensi](https://www.agensi.io) take.
+
 ## License
 
 MIT

@@ -1,6 +1,12 @@
 ---
 name: opencode-subagents
 description: Dispatch a task to an opencode agent as an async background subagent, and get back a single result envelope. Use when the user says to delegate, send, offload, or run a task on opencode, or invokes /opencode-subagents with a task.
+license: MIT
+compatibility: Requires bash 3.2+, jq, and opencode v1 (`opencode`) or v2 (`opencode2`) on PATH. Async dispatch needs an agent with background shell tasks, such as Claude Code.
+metadata:
+  author: toomingos
+  version: "1.0.0"
+  repository: https://github.com/toomingos/opencode-subagents
 ---
 
 `run.sh` lives next to this file: `.claude/skills/opencode-subagents/run.sh` for a project
@@ -50,3 +56,17 @@ yourself instead.
   agent and tell it to stay inside the repository; a `../` path outside the repo is otherwise auto-rejected
   and the agent's command just fails.
 - Outside Claude Code the call is just foreground and prints the same envelope.
+
+## What run.sh touches
+
+Everything it does is local; it sends nothing anywhere but the opencode process and server.
+
+- Runs `opencode run` (v1) or `opencode2 run` (v2), and on v2 `opencode2 service start` when the
+  shared server is not up.
+- Writes run logs to `$TMPDIR/opencode-subagents-runs` and deletes its own files there after 7 days.
+- v2 only: reads the local opencode server's URL and password from
+  `~/.local/state/opencode/service.json` (written by opencode itself) and uses `curl` against that
+  local server for health, rate-limit and interrupt calls. The password is passed on stdin, never on
+  the command line, and never written anywhere.
+- Kills only the opencode client it started (watchdog or task stop), and interrupts only sessions
+  you name with `--interrupt`.
